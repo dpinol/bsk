@@ -8,22 +8,23 @@ import (
 // Recorder is a Metrics implementation that will hold the values written by
 // its metrics types for testing purposes only.
 type Recorder struct {
-	registry map[string]Metric
+	registry map[string][]Metric
 	mu       sync.RWMutex // protects the registry
 }
 
 // NewRecorder returns an empty Recorder.
 func NewRecorder() *Recorder {
 	return &Recorder{
-		registry: make(map[string]Metric),
+		registry: make(map[string][]Metric),
 	}
 }
 
 // A RecorderMetric is the type that will implement
 // the Counter, Gauge and Event metric types.
 type RecorderMetric struct {
-	name string
-	tags Tags
+	name     string
+	tags     Tags
+	recorder *Recorder
 }
 
 // Name implements part of the Metric interface.
@@ -53,7 +54,8 @@ func (c *RecorderCounter) Val() uint64 {
 
 // Inc implements the Counter behaviour and stores the value in the Recorder.
 func (c *RecorderCounter) Inc() {
-	c.Add(1)
+	counter := c.recorder.register(c.name, c).(*RecorderCounter)
+	counter.Add(1)
 }
 
 // Add implements the Counter behaviour and stores the value in the Recorder.
@@ -235,55 +237,91 @@ func (h *RecorderHistogram) WithTag(key string, value interface{}) Histogram {
 
 // Counter implements the Metrics behaviour to return a new Counter.
 func (r *Recorder) Counter(name string, tags ...Tag) Counter {
-	m := r.Get(name)
-	if m == nil {
-		m = &RecorderCounter{RecorderMetric: RecorderMetric{name, tags}}
-		r.register(name, m)
-	}
-
-	return m.(Counter)
+	return &RecorderCounter{RecorderMetric: RecorderMetric{name, tags, r}}
 }
 
 // Gauge implements the Metrics behaviour to return a new Gauge.
 func (r *Recorder) Gauge(name string, tags ...Tag) Gauge {
-	m := &RecorderGauge{RecorderMetric: RecorderMetric{name, tags}}
+	m := &RecorderGauge{RecorderMetric: RecorderMetric{name, tags, r}}
 	r.register(name, m)
 	return m
 }
 
 // Event implements the Metrics behaviour to return a new Event.
 func (r *Recorder) Event(name string, tags ...Tag) Event {
-	m := &RecorderEvent{RecorderMetric: RecorderMetric{name, tags}}
+	m := &RecorderEvent{RecorderMetric: RecorderMetric{name, tags, r}}
 	r.register(name, m)
 	return m
 }
 
 // Timer implements the Metrics behaviour to return a new Timer.
 func (r *Recorder) Timer(name string, tags ...Tag) Timer {
-	m := &RecorderTimer{RecorderMetric: RecorderMetric{name, tags}}
+	m := &RecorderTimer{RecorderMetric: RecorderMetric{name, tags, r}}
 	r.register(name, m)
 	return m
 }
 
 // Histogram implements the Metrics behaviour to return a new Histogram
 func (r *Recorder) Histogram(name string, tags ...Tag) Histogram {
-	m := &RecorderHistogram{RecorderMetric: RecorderMetric{name, tags}}
+	m := &RecorderHistogram{RecorderMetric: RecorderMetric{name, tags, r}}
 	r.register(name, m)
 	return m
 }
 
-// Get returns the metric instance registered with the given name
-func (r *Recorder) Get(name string) Metric {
+// Get returns the metric instances registered with the given name
+func (r *Recorder) Get(name string) []Metric {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	return r.registry[name]
 }
 
-func (r *Recorder) register(name string, metric Metric) {
+// GetWithTags returns the metric with the same exact tags as it was recorded
+func (r *Recorder) GetWithTags(name string, tags ...Tag) Metric {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.get(name, tags)
+}
+
+func equalTags(tags1 Tags, tags2 Tags) bool {
+	if len(tags1) != len(tags2) {
+		return false
+	}
+	inTags2 := func(tag Tag) bool {
+		for _, t := range tags2 {
+			if t.Key == tag.Key && t.Value == tag.Value {
+				return true
+			}
+		}
+		return false
+	}
+	for _, t1 := range tags1 {
+		if !inTags2(t1) {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *Recorder) get(name string, tags Tags) Metric {
+	for _, m := range r.registry[name] {
+		if equalTags(m.Tags(), tags) {
+			return m
+		}
+	}
+	return nil
+}
+
+func (r *Recorder) register(name string, metric Metric) interface{} {
 	r.mu.Lock()
-	r.registry[name] = metric
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+	m := r.get(name, metric.Tags())
+	if m != nil {
+		return m
+	}
+	r.registry[name] = append(r.registry[name], metric)
+	return metric
 }
 
 // HasTag return whether the given metric is tagged with the given key/value pair.
